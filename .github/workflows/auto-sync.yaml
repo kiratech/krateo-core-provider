@@ -69,7 +69,6 @@ jobs:
       - name: Push Changes (If No Conflict)
         run: |
           git push origin main
-          git push --tags
 
       - name: Close Existing Sync Error Issues
         if: success()
