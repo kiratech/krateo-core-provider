@@ -1,0 +1,85 @@
+name: AutoSync
+
+on:
+  schedule:
+    - cron: '0 2 * * *' 
+  workflow_dispatch: # Allows manual triggering
+  workflow_call: # Allow this workflow to be reused
+
+jobs:
+  auto-sync:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      issues: write
+      contents: write
+    env:
+      UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO }}
+      ISSUE_LABEL: sync-error
+    steps:
+      - name: Checkout Forked Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  
+
+      - name: Get Parent Repository
+        id: upstream
+        if: ${{ env.UPSTREAM_REPO == '' }}
+        run: |
+          PARENT=$(curl -s -H "Authorization: token ${{ github.token }}" https://api.github.com/repos/${{ github.repository }} | jq -r '.parent.full_name')
+          echo "UPSTREAM_REPO=$PARENT" >> $GITHUB_ENV
+
+      - name: Add Upstream Remote
+        run: |
+          git remote add upstream https://github.com/$UPSTREAM_REPO.git
+          git fetch upstream --tags
+
+      - name: Merge Upstream Changes
+        id: merge
+        run: |
+          git checkout main
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          git merge --no-edit upstream/main | tee merge.log
+          MERGE_EXIT_CODE=${PIPESTATUS[0]}
+          if [ "$MERGE_EXIT_CODE" -gt 0 ]; then
+            {
+              echo "log<<EOF"
+              cat merge.log
+              echo "EOF"
+            } >> $GITHUB_OUTPUT
+            exit $MERGE_EXIT_CODE
+          fi
+
+      - name: Handle Merge Conflicts
+        if: ${{ failure() && steps.merge.conclusion == 'failure' }}
+        uses: jayqi/failed-build-issue-action@v1
+        with:
+          github-token: ${{ github.token }}
+          label-name: ${{ env.ISSUE_LABEL}}
+          title-template: |
+            Upstream sync failed
+          body-template: |
+            Sync job [#{{runNumber}}](https://github.com/{{repo.owner}}/{{repo.repo}}/actions/runs/{{runId}}) failed:
+            ```sh
+            ${{steps.merge.outputs.log}}
+            ```
+
+      - name: Push Changes (If No Conflict)
+        run: |
+          git push origin main
+          git push --tags
+
+      - name: Close Existing Sync Error Issues
+        if: success()
+        run: |
+          echo "Checking for existing issues..."
+          ISSUES=$(gh issue list --repo $GITHUB_REPOSITORY --label "$ISSUE_LABEL" --state "open" --json number --jq '.[].number')
+
+          for ISSUE_NUMBER in $ISSUES; do
+            echo "Closing issue #$ISSUE_NUMBER..."
+            gh issue close $ISSUE_NUMBER --repo $GITHUB_REPOSITORY --comment "The upstream sync has been resolved successfully. Closing this issue."
+          done
+        env:
+          GH_TOKEN: ${{ github.token }}
